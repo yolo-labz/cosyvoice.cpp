@@ -711,6 +711,8 @@ void cosyvoice_server_register_api_routes(Server& server, server_runtime& runtim
     });
 }
 
+#include <chrono>
+
 int cosyvoice_server_backend_run(server_runtime& runtime)
 {
     Server server;
@@ -812,6 +814,42 @@ int cosyvoice_server_backend_run(server_runtime& runtime)
     print_info_log(runtime.log_level, "  audio_encoders     : unavailable (COSYVOICE_NO_AUDIO)\n");
 #endif
     print_info_log(runtime.log_level, "-----------------------------------------------\n\n");
+
+    // Startup warm-up (EDITX_SERVER_WARMUP=0 disables). Vulkan pipelines for the
+    // streaming graphs are compiled lazily on first use, and the cost lands on
+    // whoever makes the first request: measured 23/10/2026 on the RX 5700 XT,
+    // first-audio was 4.4 s for the first streamed request, 3.0 s for the second
+    // and 0.86 s steady. One throwaway utterance here moves that ~3.5 s off the
+    // caller's first sentence and onto server start, where it belongs.
+    if (const char* warm_env = getenv("EDITX_SERVER_WARMUP"); !warm_env || atoi(warm_env) != 0)
+    {
+        if (!runtime.voice_names.empty())
+        {
+            const uint32_t warm_slot = acquire_thread_slot(runtime);
+            bool warmed = false;
+            if (auto* vctx = get_slot_voice_session(runtime, warm_slot, runtime.voice_names.front()))
+            {
+                const auto t0 = std::chrono::steady_clock::now();
+                auto discard = [](const float*, uint32_t, void*) -> bool { return true; };
+                // The graph shapes are keyed by token/mel length, so a short
+                // warm-up only pre-compiles short utterances — measured: with
+                // "Warm up." the first real request still paid 3.9 s, because
+                // its shapes were new. This sentence is long enough to emit the
+                // whole crescendo (first chunk, doubled chunks, steady chunks),
+                // which costs ~20-35 s of startup and buys <1 s first-audio for
+                // every later request. Startup is a rare event (the unit
+                // restarts on the hourly grant refresh), caller latency is not.
+                warmed = cosyvoice_tts_zero_shot_stream(
+                    vctx, "Warming up the streaming speech pipeline: this sentence is deliberately long so every chunk shape is compiled before the first caller arrives.", 1.0f, discard, nullptr);
+                const auto ms = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - t0).count();
+                print_info_log(runtime.log_level,
+                    "  warmup             : %s (%s, %.0f ms)\n",
+                    warmed ? "done" : "failed", runtime.voice_names.front().c_str(), ms);
+            }
+            release_thread_slot(runtime, warm_slot);
+        }
+    }
 
     if (!server.listen(runtime.host.c_str(), runtime.port))
     {

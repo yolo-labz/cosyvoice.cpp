@@ -458,13 +458,41 @@ bool cosyvoice_tts_stream(cosyvoice_context_t ctx, const int* text, uint32_t tex
 
     {
         use_count_guard guard(ctx);
-
         ctx->llm_clear_accepted_tokens();
         uint32_t n_tokens = 0;
         bool final = false;
+
+        // Crescendo chunking: a SMALL first chunk gets audio to the caller
+        // sooner, then the chunk grows geometrically up to the steady size.
+        // Measured 23/10/2026 on the RX 5700 XT: a fixed 14-token first chunk
+        // cost 0.86 s to first audio (0.75 s of it flow+HiFT), while a 28-token
+        // chunk cost ~1.5 s. The first chunk is the whole latency budget, so it
+        // is the one worth shrinking; later chunks amortise the per-chunk
+        // overhead and stay at the model's steady size.
+        const uint32_t steady_chunk = ctx->get_chunk_tokens();
+        uint32_t first_chunk = steady_chunk < 10 ? steady_chunk : 10;
+        if (const char* fc = getenv("EDITX_STREAM_FIRST_CHUNK"))
+        {
+            const int v = atoi(fc);
+            if (v > 0)
+                first_chunk = static_cast<uint32_t>(v);
+        }
+        // Below the flow pre-lookahead window the DiT has no context to
+        // condition on and ggml asserts (measured 23/10/2026: chunk_tokens=4
+        // tripped GGML_ASSERT "b too small compared to a" and killed the
+        // server). Clamp instead of dying: a latency knob must never be an
+        // availability knob.
+        constexpr uint32_t k_min_chunk = 8;
+        if (first_chunk < k_min_chunk || steady_chunk < k_min_chunk)
+        {
+            cosyvoice_call_ggml_log_callback(GGML_LOG_LEVEL_WARN,
+                "chunk_tokens below the flow pre-lookahead floor: clamped to 8.\n");
+            first_chunk = std::max(first_chunk, k_min_chunk);
+        }
+        first_chunk = std::min(first_chunk, std::max(steady_chunk, k_min_chunk));
+        uint32_t chunk_tokens = first_chunk;
         do
         {
-            const auto chunk_tokens = ctx->get_chunk_tokens();
 
             if (ctx->is_stop_requested())
                 return false;
@@ -482,6 +510,7 @@ bool cosyvoice_tts_stream(cosyvoice_context_t ctx, const int* text, uint32_t tex
             if (result.data && result.length > 0
                 && !callback(result.data, result.length, user_data))
                 goto cleanup;
+            chunk_tokens = std::min(std::max(steady_chunk, k_min_chunk), chunk_tokens * 2);
         } while (n_tokens != ctx->llm_get_n_accepted_tokens());
 
         return true;
