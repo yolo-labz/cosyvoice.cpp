@@ -234,7 +234,60 @@ bool cosyvoice_model_3::token2wav_ext(const int* token_ids, uint32_t n_tokens, f
     ggml_reset(ctx1.get());
     ggml_backend_sched_reset(sched.get());
 
-    ggml_tensor* token = ggml_new_tensor_1d(ctx0.get(), GGML_TYPE_I32, n_tokens);
+    // ---- incremental flow encode (streaming only) -------------------------
+    // The encode used to consume the WHOLE accepted token prefix on every chunk:
+    // the conv, the embedding lookup and the upsample all ran over the growing
+    // prefix, so a chunk cost O(prefix) and every chunk length produced a new
+    // graph shape (which the Vulkan backend compiles again — measured 23/10/2026:
+    // first requests 4.4 s / 3.0 s / 0.86 s purely from shape novelty, and
+    // streaming total RTF 1.6-1.9 against 0.38 one-shot).
+    //
+    // Streaming only needs the frames that are not emitted yet plus the flow's
+    // pre-lookahead context, and the DiT carries history in its KV cache. So
+    // feed a bounded tail window instead of the prefix: the shape set collapses
+    // to {first chunk, window}, one warm-up covers every text, and per-chunk
+    // cost stops growing with the utterance.
+    //
+    // Only valid on the path that already front-trims the encode output (all
+    // diffusion steps have KV slots): there `mu` is re-based to the new frames
+    // and the DiT consumes relative coordinates. Everywhere else the DiT trims
+    // `offset` in absolute frames, so the whole prefix stays as before.
+    const bool encode_all_steps_cached =
+        flow.decoder.diffusion_steps == params.dit_kv_fixed_slots + params.dit_kv_offloadable_slots;
+    uint32_t window = 32;
+    if (const char* w = getenv("EDITX_STREAM_ENCODE_WINDOW"))
+    {
+        const int v = atoi(w);
+        if (v >= 0)
+            window = static_cast<uint32_t>(v);
+    }
+    uint32_t slice_start = 0;      // first token index fed to the encode
+    uint32_t cut_frames = 0;       // frames to drop from the encode output
+    if (streaming && encode_all_steps_cached && window != 0 && worker->offset > 0)
+    {
+        const uint32_t ratio = static_cast<uint32_t>(std::max(1, flow.token_mel_ratio));
+        const uint32_t produced_tokens = worker->offset / ratio;
+        const uint32_t want_start = n_tokens > window ? n_tokens - window : 0;
+        // Never slice past the frames already emitted: `cut_frames` must stay
+        // non-negative, and the window must still carry the look-ahead context.
+        slice_start = std::min(produced_tokens, want_start);
+        // Keep the trim token-aligned: the encode trims in whole tokens, so an
+        // unaligned frame count would shift the new audio by a frame or two and
+        // show up as a duplicate or dropped 20 ms at the seam.
+        cut_frames = (produced_tokens - slice_start) * ratio;
+    }
+    if (getenv("EDITX_STREAM_TRACE"))
+    {
+        fprintf(stderr, "EDITX_ENC slice_start=%u cut_frames=%u enc_tokens=%u n_tokens=%u offset=%u "
+                        "ratio=%d all_cached=%d window=%u\n",
+                slice_start, cut_frames, n_tokens - slice_start, n_tokens, worker->offset,
+                flow.token_mel_ratio, encode_all_steps_cached ? 1 : 0, window);
+        fflush(stderr);
+    }
+    const uint32_t enc_tokens = n_tokens - slice_start;
+    const int* enc_ids = token_ids + slice_start;
+
+    ggml_tensor* token = ggml_new_tensor_1d(ctx0.get(), GGML_TYPE_I32, enc_tokens);
     ggml_tensor* prompt_token = ggml_new_tensor_1d(ctx0.get(), GGML_TYPE_I32, prompt->flow_prompt_speech_tokens.second);
     ggml_tensor* prompt_feat = ggml_new_tensor_2d(ctx0.get(), GGML_TYPE_F32, prompt->prompt_speech_feat.shape[1], prompt->prompt_speech_feat.shape[0]);
     ggml_tensor* embedding = ggml_new_tensor_2d(ctx0.get(), GGML_TYPE_F32, prompt->flow_embedding.shape[1], prompt->flow_embedding.shape[0]);
@@ -245,7 +298,7 @@ bool cosyvoice_model_3::token2wav_ext(const int* token_ids, uint32_t n_tokens, f
 
     // Phase 1: Flow encode
     ggml_cgraph* gf = new_cgraph(ctx0.get());
-    auto [mu, spks, conds, cut_len] = flow.build_cgraph_encode(ctx0.get(), token, prompt_token, prompt_feat, embedding, op_caps, (flow.decoder.diffusion_steps - params.dit_kv_fixed_slots - params.dit_kv_offloadable_slots) == 0 && streaming ? worker->offset : 0, streaming && !finalize);
+    auto [mu, spks, conds, cut_len] = flow.build_cgraph_encode(ctx0.get(), token, prompt_token, prompt_feat, embedding, op_caps, (encode_all_steps_cached && streaming) ? cut_frames : 0, streaming && !finalize);
     const auto seq_len = mu->ne[1];
     auto ditctx = flow.decoder.prepare_context(ctx1.get(), mu, spks, conds);
     do
@@ -342,7 +395,7 @@ bool cosyvoice_model_3::token2wav_ext(const int* token_ids, uint32_t n_tokens, f
 
     stage_build_after(0);
 
-    memcpy(token->data, token_ids, token->nb[1]);
+    memcpy(token->data, enc_ids, token->nb[1]);
     memcpy(prompt_token->data, prompt->flow_prompt_speech_tokens.first.get(), prompt_token->nb[1]);
     memcpy(prompt_feat->data, prompt->prompt_speech_feat.data, prompt_feat->nb[2]);
     memcpy(embedding->data, prompt->flow_embedding.data, embedding->nb[2]);
@@ -508,6 +561,7 @@ bool cosyvoice_model_3::token2wav_ext(const int* token_ids, uint32_t n_tokens, f
     ggml_backend_sched_reset(sched.get());
     gf = new_cgraph(ctx0.get());
 
+    ggml_tensor* dump_vocoder_in = speech_feat; // lane D oracle dump
     speech_feat = ggml_permute(ctx0.get(), speech_feat, 1, 0, 2, 3);
     if (auto ne0 = static_cast<int64_t>(speech_feat->ne[0] / speed); ne0 != speech_feat->ne[0])
         speech_feat = ggml_interpolate(ctx0.get(), speech_feat,
