@@ -1,6 +1,11 @@
 #include "cosyvoice-internal.h"
 #include "cosyvoice-model.h"
+
 #include "ggml-cpu-flag.h"
+#include <cstdio>
+#include <cstdlib>
+#include <string>
+#include <vector>
 
 #include <algorithm>
 #include <cstring>
@@ -536,6 +541,19 @@ bool cosyvoice_model_3::token2wav_ext(const int* token_ids, uint32_t n_tokens, f
     result->length = static_cast<uint32_t>(generated_speech->ne[0]);
     worker->status = ggml_backend_sched_graph_compute(sched.get(), gf);
     shared->noise_callback(COSYVOICE_NOISE_CALLBACK_STAGE_AFTER_HIFT, noise_req, noise_buffer, shared->noise_callback_ctx);
+    // lane D oracle dump: vocoder input mel [T x 80] as f32 (ne0=80 contiguous), shape in sidecar
+    if (const char* d = getenv("EDITX_ORACLE_DUMP_DIR"))
+    {
+        std::vector<float> mel(static_cast<size_t>(ggml_nelements(dump_vocoder_in)));
+        ggml_backend_tensor_get(dump_vocoder_in, mel.data(), 0, mel.size() * sizeof(float));
+        std::string base = std::string(d) + (streaming ? "/vocoder_in_stream" : "/vocoder_in");
+        if (FILE* f = fopen((base + ".f32").c_str(), "wb")) { fwrite(mel.data(), sizeof(float), mel.size(), f); fclose(f); }
+        if (FILE* f = fopen((base + ".shape").c_str(), "w"))
+        {
+            fprintf(f, "ne0=%lld ne1=%lld (ggml order: ne0 = mel bins, ne1 = frames)\n", (long long) dump_vocoder_in->ne[0], (long long) dump_vocoder_in->ne[1]);
+            fclose(f);
+        }
+    }
 
     return worker->status == GGML_STATUS_SUCCESS;
 }

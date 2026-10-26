@@ -2,6 +2,9 @@
 #include "cosyvoice-model.h"
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
+#include <string>
 #include <cstring>
 #include <exception>
 #include <stdexcept>
@@ -43,6 +46,25 @@ bool cosyvoice_model_3::llm_job_ext(const int* text, uint32_t text_len, cosyvoic
         if (llm_get_n_accepted_tokens() == 0 || llm_get_kv_cache_len() == 0)
         {
             GGML_ASSERT(text);
+            // lane D oracle dump: prefill layout (ids; text=token table, speech=speech table)
+            if (const char* d = getenv("EDITX_ORACLE_DUMP_DIR"))
+            {
+                std::string path = std::string(d) + "/prefill.txt";
+                FILE* f = fopen(path.c_str(), "w");
+                if (f)
+                {
+                    fprintf(f, "sos_speech %d\n", llm.sos_token_id);
+                    fprintf(f, "prompt_text");
+                    for (const auto& i : prompt->prompt_text) fprintf(f, " %d", i);
+                    fprintf(f, "\ntext");
+                    for (uint32_t i = 0; i != text_len; ++i) fprintf(f, " %d", text[i]);
+                    fprintf(f, "\ntask_speech %d\n", llm.task_token_id);
+                    fprintf(f, "prompt_speech");
+                    for (uint32_t i = 0; i != prompt->llm_prompt_speech_tokens.second; ++i) fprintf(f, " %d", prompt->llm_prompt_speech_tokens.first[i]);
+                    fprintf(f, "\n");
+                    fclose(f);
+                }
+            }
 
             const auto token_type = llm.embed_tokens_weight->type;
             const auto token_row_size = static_cast<uint32_t>(llm.embed_tokens_weight->nb[1]);
@@ -174,6 +196,12 @@ bool cosyvoice_model_3::llm_job_ext(const int* text, uint32_t text_len, cosyvoic
                 cur_silent_token_num = 0;
 
             llm_accept_token(token_id);
+            // lane D oracle dump: generated speech-token sequence, one id per line
+            if (const char* d = getenv("EDITX_ORACLE_DUMP_DIR"))
+            {
+                std::string path = std::string(d) + "/speech_tokens.txt";
+                if (FILE* f = fopen(path.c_str(), "a")) { fprintf(f, "%d\n", token_id); fclose(f); }
+            }
 
             if (is_stop_requested())
             {

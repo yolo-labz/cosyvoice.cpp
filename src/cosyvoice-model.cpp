@@ -1,3 +1,5 @@
+#include <cstdio>
+#include <cstdlib>
 #include "cosyvoice-model.h"
 #include "common.h"
 
@@ -492,6 +494,22 @@ void cosyvoice_model::get_noise_callback(cosyvoice_noise_callback_t* callback, v
 int cosyvoice_model::llm_sample_token()
 {
     GGML_ASSERT(worker->llm_probs);
+    // lane D oracle probe: dump the first AR step's full-vocab probs (f32) when EDITX_ORACLE_LOGITS is set.
+    if (const char* dump = getenv("EDITX_ORACLE_LOGITS"))
+    {
+        static int dumped_steps = 0;
+        if (dumped_steps == 0)
+        {
+            FILE* f = fopen(dump, "wb");
+            if (f)
+            {
+                auto vocab_size = static_cast<size_t>(get_speech_token_embed_weight()->ne[1]);
+                fwrite(worker->probs.get(), sizeof(float), vocab_size, f);
+                fclose(f);
+            }
+        }
+        dumped_steps++;
+    }
     return shared->params.sampler_ext(
         reinterpret_cast<cosyvoice_llm_token_prob_t*>(worker->nucleus_probs.get()),
         worker->nucleus_probs_len,
