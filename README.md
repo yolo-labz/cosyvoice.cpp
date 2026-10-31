@@ -521,3 +521,8 @@ Please feel free to open issues or submit pull requests for:
 - Documentation/tooling improvements
 
 If the root cause is in GGML, please submit fixes/patches upstream to GGML.
+
+---
+
+This fork is part of **[yolo-labz](https://github.com/yolo-labz)** — small tools, deliberate automation.
+[Org profile](https://github.com/yolo-labz) · [All repositories](https://github.com/orgs/yolo-labz/repositories) · Upstream project: [Lourdle/cosyvoice.cpp](https://github.com/Lourdle/cosyvoice.cpp)
