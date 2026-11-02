@@ -1,0 +1,87 @@
+# cosyvoice.cpp — the only PR gate this repository can afford to run.
+#
+# The real build is build-release.yml: nine option combinations across Windows,
+# Linux and macOS, needing ffmpeg + ICU + ONNX Runtime, and it is
+# `workflow_dispatch` only. That belongs on release day, not on every PR — and
+# it must not run on the shared self-hosted pool, which is already saturated and
+# whose vm103 host is out of disk.
+#
+# So the gate here is the cheapest step that still catches a real breakage: a
+# complete CMake configure with every optional dependency disabled, plus a
+# syntax check of the Python conversion tooling. A configure resolves the whole
+# CMake graph — every add_subdirectory target, every option, the vendored
+# submodule, and the dependency wiring in cmake/Dependencies.cmake — without
+# compiling a single object. It will not catch a C++ type error; it will catch
+# the failures that actually happen here (renamed option, missing submodule,
+# broken module path, a dependency edit that no longer resolves).
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  configure:
+    name: cmake configure
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
+        with:
+          egress-policy: audit
+
+      - name: "Checkout (submodules: vendor/pcre2)"
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Python tooling parses
+        run: |
+          set -eu
+          python3 -m compileall -q convert_model_to_gguf.py tools
+          # Every requirements.txt line must pin or bound a version: an
+          # unconstrained dependency is what silently breaks a conversion run
+          # months after the commit that added it.
+          python3 - <<'PY'
+          import pathlib
+          import sys
+
+          offenders = [
+              line.strip()
+              for line in pathlib.Path("requirements.txt").read_text(encoding="utf-8").splitlines()
+              if line.strip()
+              and not line.lstrip().startswith("#")
+              and not any(op in line for op in ("==", ">=", "<=", "~=", "!=", ">", "<"))
+          ]
+          if offenders:
+              sys.exit(f"requirements.txt lines without a version bound: {offenders}")
+          PY
+
+      - name: CMake configure, optional deps off
+        run: |
+          set -eu
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCOSYVOICE_NO_AUDIO=ON \
+            -DCOSYVOICE_NO_ICU=ON \
+            -DCOSYVOICE_NO_FRONTEND=ON \
+            -DCOSYVOICE_NO_SIMD=ON
+          # A configure that wrote no cache did not configure; fail loudly rather
+          # than letting a no-op step look green.
+          test -s build/CMakeCache.txt
+          grep -q '^COSYVOICE_NO_FRONTEND:BOOL=ON$' build/CMakeCache.txt
